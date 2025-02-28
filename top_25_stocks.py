@@ -1,43 +1,54 @@
-import os
 import streamlit as st
 import pandas as pd
-import numpy as np
 import yfinance as yf
+import numpy as np
 from ta.trend import SMAIndicator, EMAIndicator, MACD
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands
 import matplotlib.pyplot as plt
+from datetime import datetime
 
-SWING_WATCHLIST_CSV = "swing_watchlist.csv"
-CURRENCY_MAP = {"USD": "£", "GBP": "£", "GBp": "£", "EUR": "€"}
-
-def load_watchlist():
-    if os.path.exists(SWING_WATCHLIST_CSV):
-        return pd.read_csv(SWING_WATCHLIST_CSV).to_dict("records")
-    return []
-
-def save_watchlist(watchlist_list):
-    pd.DataFrame(watchlist_list).to_csv(SWING_WATCHLIST_CSV, index=False)
+def fetch_top_25_stocks():
+    s_and_p_500 = [
+        "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "JPM", "WMT", "PG",
+        "BRK-B", "V", "UNH", "MA", "HD", "DIS", "PYPL", "BAC", "CMCSA", "XOM",
+        "NFLX", "KO", "PEP", "CSCO", "INTC"
+    ]
+    top_25 = []
+    for ticker in s_and_p_500:
+        try:
+            df = yf.download(ticker, period="1mo", interval="1d", progress=False, auto_adjust=True)
+            if not df.empty:
+                volume_avg = df["Volume"].mean()
+                bb = BollingerBands(close=df["Close"], window=20, window_dev=2)
+                df["ATR"] = bb.bollinger_wband() * df["Close"].std()
+                if volume_avg > 1e6 and df["ATR"].mean() > df["Close"].std():
+                    top_25.append(ticker)
+                if len(top_25) == 25:
+                    break
+        except Exception:
+            continue
+    return top_25 if len(top_25) == 25 else s_and_p_500[:25]
 
 def flatten_columns(df):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df
 
-def compute_indicators(df, sma_window=200):
+def compute_indicators(df):
     df = flatten_columns(df)
     if df.empty or "Close" not in df.columns or "Volume" not in df.columns:
         return None
     close_series = df["Close"].squeeze()
     volume_series = df["Volume"].squeeze()
     try:
-        sma_obj = SMAIndicator(close=close_series, window=sma_window)
+        sma_obj = SMAIndicator(close=close_series, window=200)
         ema_obj = EMAIndicator(close=close_series, window=20)
         rsi_obj = RSIIndicator(close=close_series, window=14)
         macd_obj = MACD(close=close_series, window_slow=26, window_fast=12, window_sign=9)
         bb_obj = BollingerBands(close=close_series, window=20, window_dev=2)
 
-        df[f"SMA{sma_window}"] = sma_obj.sma_indicator()
+        df["SMA200"] = sma_obj.sma_indicator()
         df["EMA20"] = ema_obj.ema_indicator()
         df["RSI14"] = rsi_obj.rsi()
         df["MACD_Line"] = macd_obj.macd()
@@ -45,7 +56,7 @@ def compute_indicators(df, sma_window=200):
         df["BB_High"] = bb_obj.bollinger_hband()
         df["BB_Low"] = bb_obj.bollinger_lband()
         df["Volume_SMA"] = SMAIndicator(close=volume_series, window=20).sma_indicator()
-        df["Trend"] = np.where(df["Close"] > df[f"SMA{sma_window}"], "Uptrend", "Downtrend")
+        df["Trend"] = np.where(df["Close"] > df["SMA200"], "Uptrend", "Downtrend")
         df.dropna(inplace=True)
         return df if not df.empty else None
     except Exception:
@@ -85,7 +96,7 @@ def generate_signal_and_strength(row):
             signal, strength = "🚫 SELL", -60 if rsi > 60 else -50
     return signal, strength
 
-def get_current_price_and_changes(ticker):
+def fetch_stock_data(ticker):
     try:
         df = yf.download(ticker, period="1y", interval="1d", progress=False, auto_adjust=True)
         df = flatten_columns(df)
@@ -95,22 +106,29 @@ def get_current_price_and_changes(ticker):
             fifty_two_week_low = df["Close"].min()
             fifty_two_week_change = current_price - fifty_two_week_low
             info = yf.Ticker(ticker).info
-            code = info.get("currency", "USD")
-            return current_price, CURRENCY_MAP.get(code, "£"), one_day_change, fifty_two_week_change
+            company = info.get("shortName", ticker)
+            currency = info.get("currency", "USD")
+            sym = {"USD": "£", "GBP": "£", "EUR": "€"}.get(currency, "£")
+            df_full = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=True)
+            df_full = compute_indicators(df_full)
+            if df_full is not None:
+                last_row = df_full.iloc[-1]
+                signal, strength = generate_signal_and_strength(last_row)
+                return {
+                    "Ticker": ticker,
+                    "Company": company,
+                    "Price": f"{sym}{current_price:.2f}",
+                    "1-Day Change": f"{sym}{one_day_change:.2f}",
+                    "52-Week Change": f"{sym}{fifty_two_week_change:.2f}",
+                    "Signal": signal,
+                    "RSI14": last_row["RSI14"],
+                    "MACD_Line": last_row["MACD_Line"],
+                    "MACD_Signal": last_row["MACD_Signal"],
+                    "EMA20": last_row["EMA20"]
+                }
     except Exception:
-        return None, "£", 0, 0
-
-def fetch_technical_summary(ticker, sma_window=200):
-    df = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=True)
-    df = flatten_columns(df)
-    if df.empty:
-        return None, None
-    df = compute_indicators(df, sma_window)
-    if df is None:
-        return None, None
-    last_row = df.iloc[-1]
-    signal, strength = generate_signal_and_strength(last_row)
-    return signal, df
+        pass
+    return None
 
 def generate_swing_trading_conclusion(signal, df):
     if signal == "N/A" or df is None or df.empty:
@@ -140,29 +158,6 @@ def generate_swing_trading_conclusion(signal, df):
     elif signal == "🔴 STRONG SELL":
         return "This stock is a strong candidate for swing trading with a bearish trend, high RSI indicating overbought conditions, and high volume confirming momentum. The best decision is to enter a short position for potential downward movement, targeting quick profits within days to weeks."
     return "Unexpected signal encountered. Please review the data for accuracy."
-
-def fetch_watchlist_data(ticker, sma_window=200):
-    tkr = yf.Ticker(ticker)
-    info = tkr.info
-    company = info.get("shortName", info.get("longName", ticker))
-    price, sym, one_day_change, fifty_two_week_change = get_current_price_and_changes(ticker)
-    price_str = f"{sym}{price:.2f}" if price else "N/A"
-    signal, df = fetch_technical_summary(ticker, sma_window)
-    conclusion = generate_swing_trading_conclusion(signal, df)
-    if signal:
-        return {
-            "Ticker": ticker,
-            "Company": company,
-            "Current Price": price_str,
-            "1-Day Change": f"{sym}{one_day_change:.2f}",
-            "52-Week Change": f"{sym}{fifty_two_week_change:.2f}",
-            "RSI14": f"{df['RSI14'].iloc[-1]:.1f}" if df is not None and not df.empty else "N/A",
-            "MACD_Line": f"{df['MACD_Line'].iloc[-1]:.2f}" if df is not None and not df.empty else "N/A",
-            "MACD_Signal": f"{df['MACD_Signal'].iloc[-1]:.2f}" if df is not None and not df.empty else "N/A",
-            "EMA20": f"{df['EMA20'].iloc[-1]:.2f}" if df is not None and not df.empty else "N/A",
-            "Signal": signal
-        }
-    return {k: "N/A" for k in ["Ticker", "Company", "Current Price", "1-Day Change", "52-Week Change", "RSI14", "MACD_Line", "MACD_Signal", "EMA20", "Signal"]}
 
 def plot_full_analysis(ticker, df_full):
     if df_full is None or df_full.empty:
@@ -210,67 +205,48 @@ def plot_full_analysis(ticker, df_full):
     st.pyplot(fig)
 
 def run():
-    st.title("📈 Stock Analysis for Swing Trading")
+    st.title("🏆 Top 25 Stocks for Swing Trading")
     st.write("""
-    Analyse stocks for swing trading opportunities with technical indicators, signals, and conclusions.
-    Add tickers to your swing trading watchlist to track and visualise price movements, RSI, volume, MACD, and more.
-    **Guidance:** Swing trading targets short-term price swings (days to weeks). Look for:
+    Discover the top 25 stocks ideal for swing trading, updated daily based on high volume and volatility.
+    View buy/sell/hold signals, price changes, and dive into detailed analysis with charts for swing trading opportunities.
+    **Guidance:** Swing trading focuses on short-term price movements (days to weeks). Look for:
     - **Strong Buy/Sell Signals**: High potential for quick moves with volume confirmation.
-    - **Bollinger Bands**: Price near bands indicates volatility for entries/exits.
-    - **RSI**: Overbought (>70) or oversold (<30) suggests reversals.
-    - **MACD**: Crossovers (MACD Line > Signal Line) indicate momentum shifts.
+    - **Bollinger Bands**: Price near bands signals volatility for entries/exits.
+    - **RSI**: Above 70 (overbought), below 30 (oversold) indicates possible reversals.
+    - **MACD**: Crossovers (MACD Line > Signal Line) suggest momentum shifts.
     - **Volume Spikes**: Confirm trends or breakouts.
     - **Tip:** Use signals and conclusions to identify the best entry/exit points for quick profits.
     """)
 
-    if "swing_watchlist" not in st.session_state:
-        st.session_state.swing_watchlist = load_watchlist()
-
-    st.subheader("Manage Your Swing Trading Watchlist")
-    new_ticker = st.text_input("Add a Ticker (e.g., 'AAPL')", help="Enter a stock symbol like 'AAPL' for Apple.").upper().strip()
-    if st.button("Add Ticker") and new_ticker:
-        if any(item["ticker"] == new_ticker for item in st.session_state.swing_watchlist):
-            st.warning(f"{new_ticker} is already in your swing trading watchlist.")
-        else:
-            st.session_state.swing_watchlist.append({"ticker": new_ticker})
-            save_watchlist(st.session_state.swing_watchlist)
-            st.success(f"Added {new_ticker} to your swing trading watchlist.")
-
-    all_tickers = [item["ticker"] for item in st.session_state.swing_watchlist]
-    remove_ticker = st.selectbox("Remove a Ticker", options=[""] + all_tickers, help="Select a ticker to remove from your watchlist.")
-    if st.button("Remove Ticker") and remove_ticker:
-        st.session_state.swing_watchlist = [i for i in st.session_state.swing_watchlist if i["ticker"] != remove_ticker]
-        save_watchlist(st.session_state.swing_watchlist)
-        st.warning(f"Removed {remove_ticker} from your swing trading watchlist.")
-
-    st.subheader("Swing Trading Watchlist Table")
-    if st.session_state.swing_watchlist:
-        watchlist_data = [fetch_watchlist_data(ticker) for ticker in all_tickers]
-        df = pd.DataFrame(watchlist_data)
+    top_25 = fetch_top_25_stocks()
+    stock_data = [fetch_stock_data(ticker) for ticker in top_25]
+    stock_data = [d for d in stock_data if d is not None]
+    df = pd.DataFrame(stock_data)
+    if not df.empty:
         st.dataframe(df, use_container_width=True, height=400)
 
-        st.subheader("Swing Trading Analysis")
+        st.subheader("Deep Swing Trading Analysis")
         st.write("""
-        Select a ticker for detailed swing trading analysis, including charts, signals, and conclusions.
+        Select a ticker to see detailed analysis, including price, RSI, MACD, volume, signals, and a conclusion for swing trading.
         **Tips for Swing Trading:**
         - Use signals to identify entry/exit points (Strong Buy/Sell for high potential, Hold for neutral).
         - Combine signals with Bollinger Bands, RSI, MACD, and volume for confirmation.
         - Check the conclusion for the best decision based on current analysis.
         """)
-        selected_ticker = st.selectbox("Select Ticker for Analysis", options=[""] + all_tickers, help="Choose a ticker to see in-depth swing trading analysis.")
+        selected_ticker = st.selectbox("Select a Ticker for Deep Analysis", options=[""] + df["Ticker"].tolist(), help="Choose a ticker to see in-depth swing trading analysis.")
         if selected_ticker:
-            data = next(item for item in watchlist_data if item["Ticker"] == selected_ticker)
-            st.write(f"**Ticker:** {data['Ticker']}")
-            st.write(f"**Company:** {data['Company']}")
-            st.write(f"**Price:** {data['Current Price']}")
-            st.write(f"**1-Day Change:** {data['1-Day Change']}")
-            st.write(f"**52-Week Change:** {data['52-Week Change']}")
-            st.write(f"**RSI14:** {data['RSI14']}")
-            st.write(f"**MACD Line:** {data['MACD_Line']}")
-            st.write(f"**MACD Signal:** {data['MACD_Signal']}")
-            st.write(f"**EMA20:** {data['EMA20']}")
-            st.write(f"**Signal:** {data['Signal']}")
-            conclusion = generate_swing_trading_conclusion(data['Signal'], yf.download(selected_ticker, period="2y", interval="1d", progress=False, auto_adjust=True).pipe(compute_indicators))
+            stock = df[df["Ticker"] == selected_ticker].iloc[0]
+            st.write(f"**Ticker:** {stock['Ticker']}")
+            st.write(f"**Company:** {stock['Company']}")
+            st.write(f"**Price:** {stock['Price']}")
+            st.write(f"**1-Day Change:** {stock['1-Day Change']}")
+            st.write(f"**52-Week Change:** {stock['52-Week Change']}")
+            st.write(f"**Signal:** {stock['Signal']}")
+            st.write(f"**RSI14:** {stock['RSI14']:.1f}")
+            st.write(f"**MACD Line:** {stock['MACD_Line']:.2f}")
+            st.write(f"**MACD Signal:** {stock['MACD_Signal']:.2f}")
+            st.write(f"**EMA20:** {stock['EMA20']:.2f}")
+            conclusion = generate_swing_trading_conclusion(stock['Signal'], yf.download(selected_ticker, period="2y", interval="1d", progress=False, auto_adjust=True).pipe(compute_indicators))
             st.write(f"**Conclusion:** {conclusion}")
             st.write("""
             **Guidance:** Use this signal and conclusion to make informed swing trading decisions. Prioritise Strong Buy/Sell for high-potential trades, but confirm with volume and volatility.
